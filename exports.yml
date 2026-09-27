@@ -1,0 +1,17 @@
+psp2_gpuprof:
+  attributes: 0
+  version:
+    major: 1
+    minor: 0
+  main:
+    start: module_start
+    stop: module_stop
+  libraries:
+    psp2_gpuprof:
+      syscall: true
+      functions:
+        - psp2GpuProfBegin
+        - psp2GpuProfRead
+        - psp2GpuProfEnd
+        - psp2GpuProfGetInfo
+        - psp2GpuProfReadSignals
