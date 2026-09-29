@@ -1,0 +1,9 @@
+void main(float3 position : POSITION, float3 normal : NORMAL, float2 uv : TEXCOORD0,
+          uniform float4 mvp[4], uniform float4 world[4],
+          out float4 clip : POSITION, out float3 n : TEXCOORD0,
+          out float2 tex : TEXCOORD1) {
+    float4 p=float4(position,1);
+    clip=float4(dot(mvp[0],p),dot(mvp[1],p),dot(mvp[2],p),dot(mvp[3],p));
+    n=float3(dot(world[0].xyz,normal),dot(world[1].xyz,normal),dot(world[2].xyz,normal));
+    tex=uv;
+}

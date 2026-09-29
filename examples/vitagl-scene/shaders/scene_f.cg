@@ -1,0 +1,9 @@
+float4 main(float3 N:TEXCOORD0,float3 P:TEXCOORD1,float2 UV:TEXCOORD2,
+    uniform sampler2D tex:TEXUNIT0,uniform float alpha):COLOR {
+    float3 n=normalize(N),v=normalize(float3(0,0,16)-P);
+    float3 l=normalize(float3(5,8,6)-P),l2=normalize(float3(-6,2,3)-P);
+    float d=max(dot(n,l),0),d2=max(dot(n,l2),0);
+    float spec=pow(max(dot(n,normalize(l+v)),0),40);
+    float3 t=tex2D(tex,UV*4).rgb;
+    return float4(t*(0.12+d*0.7+d2*float3(0.2,0.35,0.6))+spec*0.8,alpha);
+}

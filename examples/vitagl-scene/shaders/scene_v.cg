@@ -1,0 +1,13 @@
+void main(float3 position:POSITION, float3 normal:NORMAL, float2 uv:TEXCOORD0,
+    uniform float3 center, uniform float3 scale, uniform float angle,
+    out float4 clip:POSITION, out float3 N:TEXCOORD0,
+    out float3 P:TEXCOORD1, out float2 UV:TEXCOORD2) {
+    float c=cos(angle),s=sin(angle);
+    float3 p=position*scale;
+    p=float3(c*p.x+s*p.z,p.y,-s*p.x+c*p.z)+center;
+    float3 n=normal/scale;
+    N=float3(c*n.x+s*n.z,n.y,-s*n.x+c*n.z);
+    P=p; UV=uv;
+    float z=p.z-16.0;
+    clip=float4(p.x*1.2,p.y*2.117647,-1.020202*z-2.020202,-z);
+}

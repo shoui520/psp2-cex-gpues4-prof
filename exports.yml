@@ -15,3 +15,5 @@ psp2_gpuprof:
         - psp2GpuProfEnd
         - psp2GpuProfGetInfo
         - psp2GpuProfReadSignals
+        - psp2GpuProfReadWork
+        - psp2GpuProfReadDiagnostic

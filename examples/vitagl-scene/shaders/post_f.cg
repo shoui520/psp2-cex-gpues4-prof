@@ -1,0 +1,10 @@
+float4 main(float2 UV:TEXCOORD0,uniform sampler2D tex:TEXUNIT0):COLOR {
+    float2 d=float2(1.0/960,1.0/544);
+    float3 c=tex2D(tex,UV).rgb*0.4;
+    c+=tex2D(tex,UV+d*float2(2,0)).rgb*0.15;
+    c+=tex2D(tex,UV-d*float2(2,0)).rgb*0.15;
+    c+=tex2D(tex,UV+d*float2(0,2)).rgb*0.15;
+    c+=tex2D(tex,UV-d*float2(0,2)).rgb*0.15;
+    float2 q=UV-0.5; c*=1-dot(q,q)*0.65;
+    return float4(c,1);
+}

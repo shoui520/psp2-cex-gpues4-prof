@@ -1,4 +1,6 @@
 #include "session.h"
+#include "work.h"
+#include "diagnostic.h"
 #include "continuations.h"
 #include <psp2kern/io/fcntl.h>
 #include <psp2kern/kernel/cpu.h>
@@ -10,6 +12,8 @@
 #include <string.h>
 
 int module_get_offset(SceUID pid, SceUID modid, int segment, size_t offset, uintptr_t *address);
+/* Retail SceSysmemForDriver NID 9C78064C; the GPU diagnostic uses mode 3. */
+int ksceKernelIsAccessibleRange(int mode, const void *address, SceSize size);
 
 static struct gp_session session;
 static SceUID guard = -1, proc_handler = -1;
@@ -21,7 +25,7 @@ static int device_retired;
 static uint32_t dumps_in_progress;
 static int startup_error = PSP2_GPUPROF_UNSUPPORTED;
 static uint32_t fingerprint;
-static uintptr_t code_base, data_base, registers;
+static uintptr_t code_base, data_base, registers, device_info;
 static SceProcEventHandler handler;
 static int (*power_try)(int owner, int system_event);
 static void (*power_unlock)(int owner);
@@ -128,6 +132,7 @@ static int acquire(void *ctx)
     if (!info || !word(info, 0x20)) goto offline;
     registers = word(info, 0x14);
     if (!registers) goto offline;
+    device_info = info;
     return 0;
 offline:
     power_unlock(-3);
@@ -137,7 +142,33 @@ offline:
 static void release(void *ctx)
 {
     (void)ctx;
+    device_info = 0;
     power_unlock(-3);
+}
+
+static int read_work_state(void *ctx, Psp2GpuProfWorkState *out)
+{
+    uintptr_t desc, state;
+    (void)ctx;
+    /* Same pointer chain/range checks as retail diagnostic 0x9e68.
+     * Never dereference GPU context pointers or read a whole state dump. */
+    if (!device_info || ksceKernelIsAccessibleRange(3, (void *)device_info, 0x860)<0)
+        return PSP2_GPUPROF_OFFLINE;
+    desc=word(device_info, 0x7f4);
+    if (!desc || (desc&3) || ksceKernelIsAccessibleRange(3, (void *)desc, 0x28)<0)
+        return PSP2_GPUPROF_OFFLINE;
+    state=word(desc, 0);
+    if (!state || (state&3) || ksceKernelIsAccessibleRange(3, (void *)state, 0x174)<0)
+        return PSP2_GPUPROF_OFFLINE;
+    __asm__ volatile("dmb sy" ::: "memory");
+    out->ta_pid=word(state, 0x144);
+    out->ta_frame=word(state, 0x108);
+    out->ta_scene=word(state, 0x110);
+    out->render_pid=word(state, 0x148);
+    out->render_frame=word(state, 0x10c);
+    out->render_scene=word(state, 0x114);
+    __asm__ volatile("dmb sy" ::: "memory");
+    return 0;
 }
 
 static uint32_t read_reg(void *ctx, uint32_t offset)
@@ -372,6 +403,8 @@ int psp2GpuProfGetInfo(Psp2GpuProfInfo *user_info)
     info.cores = 4;
     info.counters = 8;
     info.capabilities = PSP2_GPUPROF_CAP_COUNTERS | PSP2_GPUPROF_CAP_SIGNALS;
+    info.capabilities |= PSP2_GPUPROF_CAP_WORK_OBSERVATIONS;
+    info.capabilities |= PSP2_GPUPROF_CAP_DIAGNOSTIC;
     info.max_groups = PSP2_GPUPROF_MAX_GROUPS;
     rc = ksceKernelCopyToUser(user_info, &info, sizeof(info));
     unlock();
@@ -396,6 +429,48 @@ int psp2GpuProfReadSignals(const Psp2GpuProfSignalConfig *user_config,
     else if (dumps_in_progress) rc = PSP2_GPUPROF_BUSY;
     else if (!(rc = reap())) rc = gp_signals(&session, &cfg, &signals);
     if (!rc) rc = ksceKernelCopyToUser(user_signals, &signals, sizeof(signals));
+    unlock();
+done:
+    EXIT_SYSCALL(state);
+    return rc;
+}
+
+int psp2GpuProfReadDiagnostic(const Psp2GpuProfDiagnosticConfig *user_config,
+                             Psp2GpuProfDiagnostic *user_out)
+{
+    Psp2GpuProfDiagnosticConfig cfg;
+    Psp2GpuProfDiagnostic result;
+    uint32_t state;
+    int rc;
+    ENTER_SYSCALL(state);
+    rc=ksceKernelCopyFromUser(&cfg,user_config,sizeof(cfg));
+    if(rc<0) goto done;
+    if(!gp_diagnostic_config_valid(&cfg)) { rc=PSP2_GPUPROF_INVALID; goto done; }
+    rc=lock();
+    if(rc<0) goto done;
+    if(!ready) rc=startup_error;
+    else if(dumps_in_progress) rc=PSP2_GPUPROF_BUSY;
+    else if(!(rc=reap())) rc=gp_diagnostic_read(&session,read_work_state,NULL,
+                                               cfg.group,cfg.tag_group,&result);
+    if(!rc) rc=ksceKernelCopyToUser(user_out,&result,sizeof(result));
+    unlock();
+done:
+    EXIT_SYSCALL(state);
+    return rc;
+}
+
+int psp2GpuProfReadWork(Psp2GpuProfWork *user_work)
+{
+    Psp2GpuProfWork work;
+    uint32_t state;
+    int rc;
+    ENTER_SYSCALL(state);
+    rc=lock();
+    if (rc<0) goto done;
+    if (!ready) rc=startup_error;
+    else if (dumps_in_progress) rc=PSP2_GPUPROF_BUSY;
+    else if (!(rc=reap())) rc=gp_work(&session, read_work_state, NULL, &work);
+    if (!rc) rc=ksceKernelCopyToUser(user_work, &work, sizeof(work));
     unlock();
 done:
     EXIT_SYSCALL(state);
@@ -431,7 +506,7 @@ int module_start(SceSize args, void *argp)
 #ifdef GPUPROF_BEGIN_DIAGNOSTIC
     startup_log("perf-enable-v1", 0, PSP2_GPUPROF_ABI);
 #else
-    startup_log("fixed-continuations-v1", 0, PSP2_GPUPROF_ABI);
+    startup_log("work-observations-v1", 0, PSP2_GPUPROF_ABI);
 #endif
     memset(&mod, 0, sizeof(mod));
     mod.size = sizeof(mod);
@@ -456,6 +531,13 @@ int module_start(SceSize args, void *argp)
             return SCE_KERNEL_START_FAILED;
         }
     startup_log("signatures-ok", 0, i);
+    /* Config[5] -> device-info state descriptor; CPU diagnostic frame reads.
+     * No new hook: these instructions are only fingerprinted, not patched. */
+    if (memcmp((void *)(code_base+0x588e), "\x6b\x69\xc4\xf8\xf4\x37", 6) ||
+        memcmp((void *)(code_base+0x9eb8), "\xd4\xf8\x08\x21", 4)) {
+        startup_log("work-signature-mismatch", PSP2_GPUPROF_UNSUPPORTED, 0);
+        return SCE_KERNEL_START_FAILED;
+    }
     /* Validate the final halfword of the reset prologue's displaced LDR.W. */
     if (memcmp((void *)(code_base + 0x5760), "\xec\x37", 2)) {
         startup_log("signature-mismatch", PSP2_GPUPROF_UNSUPPORTED, 0x5760);

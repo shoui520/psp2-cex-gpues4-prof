@@ -1,6 +1,7 @@
 #include <psp2_gpuprof.h>
 #include <psp2_gpuprof_presets.h>
 #include <psp2_gpuprof_trace.h>
+#include <psp2_gpuprof_diagnostic.h>
 
 /* Link-only smoke check: does not configure counters. */
 int main(void)
@@ -13,5 +14,7 @@ int main(void)
     /* Link the optional API without accessing the GPU in this smoke check. */
     int (*volatile signals_api)(const Psp2GpuProfSignalConfig *, Psp2GpuProfSignals *) = psp2GpuProfReadSignals;
     (void)signals_api;
+    int (*volatile diagnostic_api)(const Psp2GpuProfDiagnosticConfig *, Psp2GpuProfDiagnostic *) = psp2GpuProfReadDiagnostic;
+    (void)diagnostic_api;
     return rc ? rc : info.status;
 }

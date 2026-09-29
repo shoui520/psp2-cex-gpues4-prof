@@ -1,0 +1,12 @@
+// Twelve distinct fetches, without the dependent sine-based coordinate warps.
+float4 main(float3 n:TEXCOORD0,float2 uv:TEXCOORD1,
+            uniform sampler2D surface:TEXUNIT0,uniform float4 tint):COLOR {
+    float3 normal=normalize(n);
+    float2 q=uv*8;
+    float3 sum=0;
+    for(int i=0;i<12;++i)
+        sum+=tex2D(surface,q+float2(0.031,0.017)*float(i)).rgb;
+    float diffuse=max(dot(normal,normalize(float3(-0.5,0.8,-0.4))),0);
+    float spec=pow(max(dot(normal,normalize(float3(-0.2,0.6,-0.8))),0),24);
+    return float4(sum/12*tint.rgb*(0.16+diffuse*0.84)+spec*0.4,tint.a);
+}
