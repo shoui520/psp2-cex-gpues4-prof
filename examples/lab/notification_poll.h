@@ -3,7 +3,7 @@
 #include <stdint.h>
 #include <string.h>
 
-/* Lab slots are written once with index+1 and never reused during a capture.
+/* Slots are written once with index+1 and never reused during a capture.
  * Reset this cache only after the sampler joins and before clearing slots.
  * published is an acquire-loaded count of notification pairs submitted (or
  * about to be submitted). This does not make GPU writes atomic with sampling.

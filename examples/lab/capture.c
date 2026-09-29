@@ -58,7 +58,7 @@ static uint64_t context_id(SceGxmContext *c) {
     psp2GpuProfIdentityInvalidate(&identity_tracker);
     return 0;
   }
-  return 1; /* Lab uses one context; never export its address. */
+  return 1; /* This example uses one context; never export its address. */
 }
 static struct {
   unsigned scene, ordinal, vs, fs, count;

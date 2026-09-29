@@ -1,4 +1,4 @@
-/* Real 3D workload using only the public capture API. No GPU Lab dependency. */
+/* Real 3D workload using the public capture API. */
 #include <vitaGL.h>
 #include <psp2/io/stat.h>
 #include <psp2/kernel/processmgr.h>

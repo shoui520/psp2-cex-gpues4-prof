@@ -1,4 +1,4 @@
-/* Standalone application using the public recorder, with no GPU Lab code.
+/* Standalone application using the public recorder.
  * The fixed-function triangle exercises vitaGL -> GXM recording. It is not
  * a performance benchmark and does not collect hardware samples. */
 #include <vitaGL.h>
