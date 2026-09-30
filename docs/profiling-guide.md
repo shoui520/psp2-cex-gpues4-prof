@@ -123,17 +123,165 @@ fclose(f);
 
 ## Analyze
 
+Usage the analyzer on a GPU capture .csv:
 ```sh
 python3 tools/analyze.py capture.csv
 ```
 
+Example output:
 ```text
-Estimated fragment processing — captured intervals, four-core average
-Transparent overdraw             ████████████████████████████████  1372.986 ms
-Opaque textured geometry         ██████████                         426.073 ms
-Offscreen composite              █████                              217.387 ms
-Unlabelled                       ███                                114.552 ms
+
+  GPU Profiling Summary
+  ───────────────────────────────────────────────────────────────────────────────────────────
+
+  Dominant pass  Transparent overdraw
+                 64.4% of attributed fragment time
+
+  Attributed     2,130.998 ms     Draws with timing  813/1,206
+
+  Fragment processing · capture totals · four-core average
+
+  Passes
+
+  Name                              Relative time              Time   Share     Timed draws
+  Transparent overdraw              ████████████████   1,372.986 ms   64.4%         232/240
+  Opaque textured geometry          █████                426.073 ms   20.0%         444/780
+  Offscreen composite               ███                  217.387 ms   10.2%           28/60
+  Unlabelled                        █                    114.552 ms    5.4%         109/126
+
+  Most expensive draw groups
+
+  Name                              Relative time              Time   Share     Timed draws
+  Color and depth clear             ████████████████     298.803 ms   14.0%           28/30
+    Opaque textured geometry / fs1
+  Five-tap filtered fullscreen      ████████████         217.387 ms   10.2%           28/30
+    Offscreen composite / fs4
+  Transparent shell 7               ███████████          196.252 ms    9.2%           29/30
+    Transparent overdraw / fs3
+  Transparent shell 5               ██████████           189.736 ms    8.9%           29/30
+    Transparent overdraw / fs3
+  Transparent shell 6               ██████████           180.212 ms    8.5%           29/30
+    Transparent overdraw / fs3
+  Transparent shell 3               █████████            174.421 ms    8.2%           29/30
+    Transparent overdraw / fs3
+  Transparent shell 4               █████████            168.070 ms    7.9%           29/30
+    Transparent overdraw / fs3
+  Transparent shell 2               █████████            160.688 ms    7.5%           29/30
+    Transparent overdraw / fs3
+  … 30 more in --json
+
+  Fragment shaders
+
+  Name                              Relative time              Time   Share     Timed draws
+  fs3                               ████████████████   1,372.986 ms   64.4%         232/240
+  fs1                               ████                 312.212 ms   14.7%           76/93
+  fs2                               ███                  228.413 ms   10.7%         477/783
+  fs4                               ███                  217.387 ms   10.2%           28/30
+  fs5 / GXM mask update             ·                             —       —            0/60
+
+  Share = attributed time only. Timed draws = with timing / recorded.
+  Estimated timings. Unsampled work is excluded.
+
+  ───────────────────────────────────────────────────────────────────────────────────────────
+  Pipeline activity
+
+  Observed during matched application draw windows.
+  Sample hits, not time or utilization. Signals overlap; groups are read separately.
+
+  Shader execution
+  Signal                                  Sample hits         Rate  Hits / samples    Units
+  Shader engine non-idle                  ███████▋           47.6%     1,282/2,694    16/16
+  Shader datapath running                 ███████            43.8%     1,179/2,694    16/16
+  Fragment instruction activity           ██████▉            42.9%     1,154/2,693    16/16
+  Vertex instruction activity             ▏                   1.0%        28/2,693    16/16
+  Shader datapath stalled                 ▏                   0.4%        10/2,694    16/16
+  Firmware instruction activity           ▏                  <0.1%         1/2,693    16/16
+  Tile-end instruction activity           ·                   0.0%         0/2,693    16/16
+
+  Shader waits
+  Signal                                  Sample hits         Rate  Hits / samples    Units
+  Texture issue stall                     ▏                   0.3%         7/2,675    16/16
+  Load/store issue stall                  ·                   0.0%         0/2,675    16/16
+  Pixel-output interface stall            ·                   0.0%         0/2,675    16/16
+  PDS interface stall                     ·                   0.0%         0/2,675    16/16
+  ISP interface stall                     ·                   0.0%         0/2,675    16/16
+  MTE interface stall                     ·                   0.0%         0/2,675    16/16
+  SOC interface stall                     ·                   0.0%         0/2,675    16/16
+
+  Texture / data cache
+  Signal                                  Sample hits         Rate  Hits / samples    Units
+  Texture requests outstanding            ██▏                13.3%          91/686      4/4
+  Data-cache return stall                 ▏                   0.3%           2/683      4/4
+  Texture L1/L2 stall                     ·                   0.0%           0/686      4/4
+  Texture memory-interface stall          ·                   0.0%           0/686      4/4
+  Texture internal FIFO stall             ·                   0.0%           0/686      4/4
+  Data-cache L1/L2 stall                  ·                   0.0%           0/683      4/4
+  Data-cache memory-interface stall       ·                   0.0%           0/683      4/4
+
+  Shader feed
+  Signal                                  Sample hits         Rate  Hits / samples    Units
+  PDS shader-task queue stall             ▎                   1.4%          10/692      4/4
+  PDS pixel partition stall               ▏                   1.2%           8/692      4/4
+  PDS pixel dependency stall              ·                   0.0%           0/692      4/4
+  PDS data-cache wait                     ·                   0.0%           0/692      4/4
+  PDS code-cache wait                     ·                   0.0%           0/692      4/4
+
+  Idle signals
+  Signal                                  Sample hits         Rate  Hits / samples    Units
+  Texture pipe idle                       ████████████       75.3%     1,019/1,354      8/8
+  Shader datapath idle                    ████████▉          55.8%     1,511/2,708    16/16
+  Units = observed / expected core-and-pipe combinations.
+
+  Pipeline observations by pass
+  Pass                                Shader running     Texture issue     Texture L1/L2
+  Transparent overdraw                 42.3% / 1,661      0.1% / 1,666        0.0% / 416
+  Opaque textured geometry               12.6% / 523        0.0% / 518        0.0% / 140
+  Offscreen composite                    96.3% / 297        1.7% / 295         0.0% / 71
+  Unlabelled                             58.7% / 213        0.0% / 196         0.0% / 59
+
+  Pipeline observations by fragment shader
+  Fragment shader                     Shader running     Texture issue     Texture L1/L2
+  fs3                                  42.3% / 1,661      0.1% / 1,666        0.0% / 416
+  fs1                                     3.5% / 398        0.0% / 372        0.0% / 106
+  fs2                                    52.4% / 338        0.0% / 342         0.0% / 93
+  fs4                                    96.3% / 297        1.7% / 295         0.0% / 71
+  fs5                                              —                 —                 —
+  Cells: hit rate / samples. Texture columns show stalls, not exclusive costs.
+
+  ───────────────────────────────────────────────────────────────────────────────────────────
+  Fragment timing by GPU core
+
+  Core 0  ████████████████████████    2,122.205 ms
+  Core 1  ████████████████████████    2,146.608 ms
+  Core 2  ████████████████████████    2,117.945 ms
+  Core 3  ████████████████████████    2,137.232 ms
+  Concurrent core estimates; the rankings above use their average.
+
+  ───────────────────────────────────────────────────────────────────────────────────────────
+  Capture
+
+  Recorded events             58,741    Draw calls                   1,206
+  Hardware samples             3,859    Presentations                   93
+  Scenes closed            123 / 123    Transfer calls                   7
+  Labelled draw frames            30    Fragment shaders                 5
+  Recording span             3.398 s    Dropped events                   0
+  Observed GPU clocks   111 MHz (3,859 reads)
+
+  Timing coverage
+
+  Draws without timing   393 / 1,206    Failed samples                   0
+  Unassigned gaps       1,197.776 ms   (CPU-clock envelope)
+  Sample gap · mean         862.9 µs    Sample gap · max        1,641.0 µs
+
+  Excluded timing observations
+  inactive/unmapped PDS                       3,875
+  PDS changed                                   749
+  scheduler changed                              12
+
+  Matched signal observations: 10,800
+  outside matched PDS draw windows                  4,636
 ```
+Pass `--json` for JSON output.  
 
 If timing is unavailable, the report prints the reason. Common causes: no
 identity seed, capture buffer overflow, or instanced/precomputed draws and
