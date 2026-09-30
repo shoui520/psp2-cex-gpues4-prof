@@ -346,7 +346,12 @@ def summarize(events, dropped=0):
         if not scene["closed"]:
             warn("scene lacks observed successful end")
     timing = sampled_timing(events, draws, scenes, diagnostics, dropped)
+    # Identity seeds and synthetic state records may have no timestamp. They
+    # must not turn a short capture into a span starting at system boot.
+    timestamped = [e for e in events if e['before_us'] > 0]
     return {"format_version": 1, "events": len(events), "dropped": dropped,
+            "capture_span_us": (max(e['after_us'] for e in timestamped) -
+                                min(e['before_us'] for e in timestamped)) if timestamped else 0,
             "warnings": dict(warnings), "draws": draws, "scenes": scenes,
             "diagnostics": diagnostics,
             "transfers": transfers, "presentations": presentations,
@@ -436,7 +441,7 @@ def sampled_timing(events, draws, scenes, samples, dropped, max_gap_us=3500):
     previous, durations, sensitivity = {}, Counter(), Counter()
     rejected, reasons, hit = Counter(), Counter(), Counter()
     shader_times, shader_sensitivity, pass_times = Counter(), Counter(), Counter()
-    gaps, widths = [], []
+    gaps, widths, signal_windows = [], [], []
     for sample in sorted(samples, key=lambda s: s["sample_id"]):
         i = sample["sample_id"]
         cpu = (sample["before_us"] + sample["after_us"]) / 2
@@ -481,6 +486,7 @@ def sampled_timing(events, draws, scenes, samples, dropped, max_gap_us=3500):
                 reasons[reason] += 1
             elif ident is not None:
                 hit[ident] += 1
+                signal_windows.append((sample['thread'], i, c, ident[1]))
             if mhz in (111, 222):
                 widths.append(width / (6.920455 * mhz / 111))
             tick = (core["timer_before"] + width // 2) & 0xffffffff
@@ -537,6 +543,7 @@ def sampled_timing(events, draws, scenes, samples, dropped, max_gap_us=3500):
                     for d in draws if (s := d["fragment_shader"])}
     output.update(available=bool(durations), reason="" if durations else "no assignable timing intervals",
         matched_core_observations=sum(hit.values()), observation_rejections=dict(reasons),
+        signal_windows=signal_windows,
         unassigned_gap_ms=dict(rejected),
         sampling_gap_us={"min": min(gaps), "max": max(gaps), "mean": sum(gaps)/len(gaps)} if gaps else None,
         max_timer_bracket_us=max(widths, default=None),
@@ -607,6 +614,124 @@ def json_numbers(value):
     return value
 
 
+# SGX543 debug-bus bit observations. Rates below are sampled assertion fractions,
+# not counted events, arithmetic utilization or additive stall-time components.
+# Each tuple lists independently sampled (group, bit) selectors for one metric.
+PIPELINE_METRICS = [
+    ('usse_running', 'Shader execution', 'Shader datapath running', [(g, 3) for g in (71,72,103,104)]),
+    ('usse_nonidle', 'Shader execution', 'Shader engine non-idle', [(g, 0) for g in (71,72,103,104)]),
+    ('usse_stalled', 'Shader execution', 'Shader datapath stalled', [(g, 4) for g in (71,72,103,104)]),
+    ('fragment_instructions', 'Shader execution', 'Fragment instruction activity', [(g, 17) for g in (75,76,107,108)]),
+    ('vertex_instructions', 'Shader execution', 'Vertex instruction activity', [(g, 15) for g in (75,76,107,108)]),
+    ('tile_end_instructions', 'Shader execution', 'Tile-end instruction activity', [(g, 16) for g in (75,76,107,108)]),
+    ('firmware_instructions', 'Shader execution', 'Firmware instruction activity', [(g, 14) for g in (75,76,107,108)]),
+    ('usse_texture_stall', 'Shader waits', 'Texture issue stall', [(g, 17) for g in (77,78,109,110)]),
+    ('usse_load_store_stall', 'Shader waits', 'Load/store issue stall', [(g, 22) for g in (77,78,109,110)]),
+    ('usse_output_stall', 'Shader waits', 'Pixel-output interface stall', [(g, 20) for g in (77,78,109,110)]),
+    ('usse_pds_stall', 'Shader waits', 'PDS interface stall', [(g, 21) for g in (77,78,109,110)]),
+    ('usse_isp_stall', 'Shader waits', 'ISP interface stall', [(g, 18) for g in (77,78,109,110)]),
+    ('usse_mte_stall', 'Shader waits', 'MTE interface stall', [(g, 19) for g in (77,78,109,110)]),
+    ('usse_socif_stall', 'Shader waits', 'SOC interface stall', [(g, 16) for g in (77,78,109,110)]),
+    ('texture_l1_l2_stall', 'Texture / data cache', 'Texture L1/L2 stall', [(43,7)]),
+    ('texture_memory_stall', 'Texture / data cache', 'Texture memory-interface stall', [(43,11)]),
+    ('texture_fifo_stall', 'Texture / data cache', 'Texture internal FIFO stall', [(43,4)]),
+    ('texture_outstanding', 'Texture / data cache', 'Texture requests outstanding', [(43,0)]),
+    ('data_l1_l2_stall', 'Texture / data cache', 'Data-cache L1/L2 stall', [(55,12)]),
+    ('data_memory_stall', 'Texture / data cache', 'Data-cache memory-interface stall', [(55,18)]),
+    ('data_return_stall', 'Texture / data cache', 'Data-cache return stall', [(55,28)]),
+    ('pds_usse_stall', 'Shader feed', 'PDS shader-task queue stall', [(4,3)]),
+    ('pds_dependency_stall', 'Shader feed', 'PDS pixel dependency stall', [(4,18)]),
+    ('pds_partition_stall', 'Shader feed', 'PDS pixel partition stall', [(4,21)]),
+    ('pds_data_wait', 'Shader feed', 'PDS data-cache wait', [(4,16)]),
+    ('pds_code_wait', 'Shader feed', 'PDS code-cache wait', [(4,17)]),
+    ('texture_idle', 'Idle signals', 'Texture pipe idle', [(2,3),(2,12)]),
+    ('datapath_idle', 'Idle signals', 'Shader datapath idle', [(2,b) for b in (6,9,15,18)]),
+]
+
+
+def pipeline_report(report, shader_ids):
+    """Pipeline co-observations in accepted PDS windows, never exclusive costs."""
+    samples = report['diagnostics']
+    windows = {(thread, sample, core): seq for thread, sample, core, seq in
+               report['sampled_fragment_timing'].get('signal_windows', [])}
+    draws = {d['sequence']: d for d in report['draws']}
+    lookup = {}
+    for metric, category, name, selectors in PIPELINE_METRICS:
+        for group, bit in selectors:
+            lookup.setdefault(group, []).append((metric, bit))
+    totals, by_pass, by_shader = {}, {}, {}
+    rejected, hazards = Counter(), Counter()
+    accepted = 0
+    def add(collection, metric, group, bit, core, value):
+        counts = collection.setdefault(metric, Counter())
+        counts[group, bit, core, 'observed'] += 1
+        counts[group, bit, core, 'asserted'] += bool(value & (1 << bit))
+    for sample in samples:
+        if sample['result']:
+            continue
+        for core in sample['cores']:
+            if sample.get('abi') != 1 or sample.get('driver_fingerprint') != 0xc0f361a3:
+                rejected['unsupported ABI/driver'] += 1
+                continue
+            if sample['group'] not in lookup or sample.get('tag_group') not in (70,102):
+                rejected['unsupported signal group'] += 1
+                continue
+            flags = 1
+            if core['scheduler_before'] != core['scheduler_after']: flags |= 2
+            if core['pds_before'] != core['pds_after']: flags |= 4
+            if core['tag_before'] != core['tag_after']: flags |= 8
+            words = [core[k] for k in ('pds_before','pds_after','tag_before','tag_after')]
+            if any(not w & 0x20000000 or not w & 0x1fff0000 for w in words): flags |= 16
+            if any((core[f'pds_{end}'] & 0x1fffffff) != (core[f'tag_{end}'] & 0x1fffffff)
+                   for end in ('before','after')): flags |= 32
+            if flags != core['flags']:
+                rejected['inconsistent diagnostic flags'] += 1
+                continue
+            seq = windows.get((sample['thread'], sample['sample_id'], core['core']))
+            if seq not in draws:
+                rejected['outside matched PDS draw windows'] += 1
+                continue
+            accepted += 1
+            if flags & 8: hazards['TAG changed'] += 1
+            if flags & 32: hazards['PDS/TAG stage disagreement'] += 1
+            draw = draws[seq]
+            shader = draw['fragment_shader']
+            shader_id = shader_ids.get((shader['patcher'],shader['handle'],shader['generation']))
+            for metric, bit in lookup[sample['group']]:
+                for collection in (totals, by_pass.setdefault(draw['pass'] or 'Unlabelled', {}),
+                                   by_shader.setdefault(shader_id, {})):
+                    add(collection, metric, sample['group'], bit, core['core'], core['value'])
+
+    def rows(collection, detailed=False):
+        result = []
+        for metric, category, name, selectors in PIPELINE_METRICS:
+            counts = collection.get(metric, {})
+            units = []
+            for group, bit in selectors:
+                for core in range(4):
+                    n = counts.get((group, bit, core, 'observed'), 0)
+                    hit = counts.get((group, bit, core, 'asserted'), 0)
+                    units.append(dict(group=group, bit=bit, core=core, observed=n, asserted=hit,
+                                      sample_hit_pct=100*hit/n if n else None))
+            n = sum(u['observed'] for u in units)
+            hit = sum(u['asserted'] for u in units)
+            row = dict(id=metric, category=category, name=name, observed=n, asserted=hit,
+                               sample_hit_pct=100*hit/n if n else None,
+                               covered_units=sum(u['observed'] > 0 for u in units),
+                                expected_units=len(units))
+            if detailed:
+                row['units'] = units
+            result.append(row)
+        return result
+    return dict(available=bool(accepted), scope='matched_application_PDS_draw_windows',
+                measurement='sampled_signal_assertion_fraction', exclusive_draw_ownership=False,
+                accepted_core_observations=accepted, rejected_core_observations=dict(rejected),
+                association_hazards=dict(hazards), metrics=rows(totals, detailed=True),
+                by_pass=[dict(name=k, metrics=rows(v)) for k,v in sorted(by_pass.items())],
+                by_fragment_shader=[dict(id=k, metrics=rows(v)) for k,v in
+                                    sorted(by_shader.items(), key=lambda item: str(item[0]))])
+
+
 def agent_report(report):
     """Versioned analysis, without duplicating raw events or hardware samples."""
     timing = report['sampled_fragment_timing']
@@ -654,6 +779,14 @@ def agent_report(report):
     top = pass_rows[0] if available and pass_rows else None
     failed = sum(bool(s['result']) for s in report['diagnostics'])
     untimed = sum(d.get('sampled_fragment_ms') is None for d in draws)
+    per_core = []
+    for core in range(4):
+        values = [d['sampled_fragment_per_core_ms'][core] for d in draws
+                  if d.get('sampled_fragment_per_core_ms') is not None
+                  and d['sampled_fragment_per_core_ms'][core] is not None]
+        per_core.append(dict(core=core, estimated_fragment_ms=sum(values) if values else None))
+    clocks = Counter(s['clock_before_mhz'] for s in report['diagnostics']
+                     if s['clock_before_mhz'] == s['clock_after_mhz'] and s['clock_before_mhz'] > 0)
     return dict(schema='psp2-gpuprof.analysis', schema_version=1,
         status='estimated' if available else 'timing_unavailable',
         timing_unavailable_reason=None if available else timing['reason'],
@@ -666,6 +799,12 @@ def agent_report(report):
                      attributed_fragment_ms=total,
                      dominant_pass_share_pct=top['share_of_attributed_time_pct'] if top else None),
         capture=dict(events=report['events'], dropped_events=report['dropped'],
+            span_ms=report.get('capture_span_us', 0)/1000,
+            labelled_frames=len({(d['thread'],d['frame']) for d in draws if d['frame'] is not None}),
+            fragment_shaders=len(keys),
+            observed_gpu_clocks=[dict(mhz=k,samples=v) for k,v in sorted(clocks.items())],
+            changing_or_unknown_clock_samples=sum(s['clock_before_mhz'] != s['clock_after_mhz']
+                or not s['clock_before_mhz'] for s in report['diagnostics']),
             draws=len(draws), scenes=len(report['scenes']),
             closed_scenes=sum(s['closed'] for s in report['scenes']),
             hardware_samples=len(report['diagnostics']), transfers=len(report['transfers']),
@@ -677,30 +816,119 @@ def agent_report(report):
             sampling_gap_us=timing.get('sampling_gap_us'),
             max_timer_bracket_us=timing.get('max_timer_bracket_us')),
         passes=pass_rows, fragment_shaders=ranked(shaders), draw_groups=ranked(groups),
+        per_core_fragment_timing=per_core, pipeline_activity=pipeline_report(report, shader_ids),
         warnings=[dict(message=message,count=count) for message,count in sorted(report['warnings'].items())])
 
 
 def format_report(report):
     """Plain-text report; capture labels never emit terminal control codes."""
-    rule = "─" * 76
+    analysis = agent_report(report)
+    rule = "─" * 91
     lines = ["", "  GPU Profiling Summary", "  " + rule]
     timing = report["sampled_fragment_timing"]
+    def label(value, width=32):
+        text = ascii(value or 'Unnamed')[1:-1]
+        return text if len(text) <= width else text[:width-1] + '…'
+
+    def percent(value):
+        return '<0.1%' if 0 < value < .1 else f'{value:.1f}%'
+
+    def percent_bar(value):
+        eighths = max(1, round(value * 16 * 8 / 100)) if value else 0
+        full, fraction = divmod(eighths, 8)
+        return '█' * full + ('▏▎▍▌▋▊▉'[fraction-1] if fraction else '') or '·'
+
+    def ranking(title, rows, limit=None, details=False):
+        lines.extend(['', '  ' + title, '',
+            f"  {'Name':32}  {'Relative time':16}  {'Time':>13}  {'Share':>6}  {'Timed draws':>14}"])
+        maximum = max((r['estimated_fragment_ms'] or 0 for r in rows), default=0)
+        shown = rows if limit is None else rows[:limit]
+        for row in shown:
+            cost = row['estimated_fragment_ms']
+            share = row['share_of_attributed_time_pct']
+            length = max(1, round(16*cost/maximum)) if cost and maximum else 0
+            bar = '█' * length if cost is not None else '·'
+            value = f'{cost:,.3f} ms' if cost is not None else '—'
+            percent = f'{share:.1f}%' if share is not None else '—'
+            name = row.get('id') or row['name']
+            if row.get('id') and row.get('name'):
+                name += ' / ' + row['name']
+            coverage = f"{row['timed_draw_count']:,}/{row['draw_count']:,}"
+            lines.append(f"  {label(name):32}  {bar:16}  {value:>13}  {percent:>6}  {coverage:>14}")
+            if details:
+                context = f"{row['pass_name']} / {row['fragment_shader_id'] or 'unknown shader'}"
+                lines.append('    ' + label(context, 87))
+        if len(shown) < len(rows):
+            lines.append(f'  … {len(rows)-len(shown)} more in --json')
+
     if timing["available"]:
-        lines += ["", "  Fragment processing · capture totals · four-core average", "",
-                  f"  {'Pass':27}  {'Relative time':28}  {'Time':>13}"]
-        passes = sorted(timing["passes"], key=lambda p: p["estimated_ms"], reverse=True)
-        longest = max((p["estimated_ms"] for p in passes), default=0)
-        for p in passes:
-            name = ascii(p["name"])[1:-1]
-            if len(name) > 27:
-                name = name[:26] + "…"
-            size = max(1, round(28*p["estimated_ms"]/longest)) if longest and p["estimated_ms"] > 0 else 0
-            bar = "█" * size
-            value = f"{p['estimated_ms']:,.3f} ms"
-            lines.append(f"  {name:27}  {bar:28}  {value:>13}")
-        lines += ["", "  Estimated timings. Unsampled work is excluded."]
+        summary = analysis['summary']
+        share = summary['dominant_pass_share_pct']
+        dominant_share = f'{share:.1f}%' if share is not None else '—'
+        lines += ['', f"  Dominant pass  {label(summary['dominant_pass'],50)}",
+                  f"                 {dominant_share} of attributed fragment time",
+                  '', f"  Attributed     {summary['attributed_fragment_ms']:,.3f} ms"
+                  f"     Draws with timing  {analysis['coverage']['timed_draws']:,}/{len(report['draws']):,}",
+                  '', '  Fragment processing · capture totals · four-core average']
+        ranking('Passes', analysis['passes'])
+        ranking('Most expensive draw groups', analysis['draw_groups'], limit=8, details=True)
+        ranking('Fragment shaders', analysis['fragment_shaders'], limit=8)
+        lines += ['', '  Share = attributed time only. Timed draws = with timing / recorded.',
+                  '  Estimated timings. Unsampled work is excluded.']
     else:
         lines += ["", "  Fragment timing unavailable", "  " + ascii(timing["reason"])[1:-1]]
+
+    activity = analysis['pipeline_activity']
+    lines += ['', '  ' + rule, '  Pipeline activity', '']
+    if activity['available']:
+        lines += ['  Observed during matched application draw windows.',
+                  '  Sample hits, not time or utilization. Signals overlap; groups are read separately.']
+        categories = list(dict.fromkeys(m['category'] for m in activity['metrics']))
+        missing = []
+        for category in categories:
+            rows = [m for m in activity['metrics'] if m['category'] == category and m['observed']]
+            if not rows:
+                missing.append(category)
+                continue
+            rows.sort(key=lambda m: -m['sample_hit_pct'])
+            lines += ['', '  ' + category,
+                      f"  {'Signal':38}  {'Sample hits':16}  {'Rate':>6}  {'Hits / samples':>14}  {'Units':>7}"]
+            for row in rows:
+                rate = row['sample_hit_pct']
+                bar = percent_bar(rate)
+                fraction = f"{row['asserted']:,}/{row['observed']:,}"
+                units = f"{row['covered_units']}/{row['expected_units']}"
+                lines.append(f"  {row['name']:38}  {bar:16}  {percent(rate):>6}  {fraction:>14}  {units:>7}")
+        lines += ['  Units = observed / expected core-and-pipe combinations.']
+        if missing:
+            lines += ['', '  No matched samples: ' + ', '.join(missing)]
+        for title, field, source, costs in (
+                ('pass', 'name', activity['by_pass'], analysis['passes']),
+                ('fragment shader', 'id', activity['by_fragment_shader'], analysis['fragment_shaders'][:8])):
+            lines += ['', '  Pipeline observations by ' + title,
+                      f"  {title.capitalize():32}  {'Shader running':>16}  {'Texture issue':>16}  {'Texture L1/L2':>16}"]
+            scopes = {p[field]: p for p in source}
+            for p in costs:
+                metrics = {m['id']: m for m in scopes.get(p[field], {}).get('metrics', [])}
+                cells = []
+                for key in ('usse_running', 'usse_texture_stall', 'texture_l1_l2_stall'):
+                    m = metrics.get(key)
+                    cells.append(f"{percent(m['sample_hit_pct'])} / {m['observed']:,}" if m and m['observed'] else '—')
+                lines.append(f"  {label(p[field]):32}  " + '  '.join(f'{c:>16}' for c in cells))
+        lines += ['  Cells: hit rate / samples. Texture columns show stalls, not exclusive costs.']
+    else:
+        lines += ['  No supported signal samples matched to application draws.']
+
+    cores = analysis['per_core_fragment_timing']
+    if any(c['estimated_fragment_ms'] is not None for c in cores):
+        lines += ['', '  ' + rule, '  Fragment timing by GPU core', '']
+        maximum = max(c['estimated_fragment_ms'] or 0 for c in cores)
+        for c in cores:
+            value = c['estimated_fragment_ms']
+            bar = '█' * max(1, round(24*value/maximum)) if value and maximum else '·'
+            duration = f'{value:,.3f} ms' if value is not None else '—'
+            lines.append(f"  Core {c['core']}  {bar:24}  {duration:>14}")
+        lines += ['  Concurrent core estimates; the rankings above use their average.']
 
     lines += ["", "  " + rule, "  Capture", ""]
     def pair(left, value, right, other):
@@ -709,12 +937,33 @@ def format_report(report):
     pair("Hardware samples", f"{len(report['diagnostics']):,}", "Presentations", f"{len(report['presentations']):,}")
     pair("Scenes closed", f"{sum(s['closed'] for s in report['scenes']):,} / {len(report['scenes']):,}",
          "Transfer calls", f"{len(report['transfers']):,}")
+    pair('Labelled draw frames', f"{analysis['capture']['labelled_frames']:,}",
+         'Fragment shaders', f"{analysis['capture']['fragment_shaders']:,}")
+    pair('Recording span', f"{analysis['capture']['span_ms']/1000:,.3f} s",
+         'Dropped events', f"{report['dropped']:,}")
+    clocks = analysis['capture']['observed_gpu_clocks']
+    lines.append('  Observed GPU clocks   ' + (', '.join(f"{c['mhz']} MHz ({c['samples']:,} reads)"
+                                                       for c in clocks) or 'unavailable'))
+    changed = analysis['capture']['changing_or_unknown_clock_samples']
+    if changed:
+        lines.append(f'  Changing/unknown clock readings: {changed:,}')
     if "draws_without_timing" in timing:
         lines += ["", "  Timing coverage", ""]
         pair("Draws without timing", f"{timing['draws_without_timing']:,} / {len(report['draws']):,}",
              "Failed samples", f"{timing['failed_samples']:,}")
         gaps = sum(timing["unassigned_gap_ms"].values())
         lines.append(f"  Unassigned gaps      {gaps:>10,.3f} ms   (CPU-clock envelope)")
+        sampling = timing.get('sampling_gap_us')
+        if sampling:
+            pair('Sample gap · mean', f"{sampling['mean']:,.1f} µs",
+                 'Sample gap · max', f"{sampling['max']:,.1f} µs")
+        lines += ['', '  Excluded timing observations']
+        for reason, count in sorted(timing.get('observation_rejections', {}).items(), key=lambda p: -p[1]):
+            lines.append(f'  {reason:38} {count:>10,}')
+    if activity['accepted_core_observations'] or activity['rejected_core_observations']:
+        lines += ['', f"  Matched signal observations: {activity['accepted_core_observations']:,}"]
+        for reason, count in activity['rejected_core_observations'].items():
+            lines.append(f'  {reason:44} {count:>10,}')
     if report["warnings"]:
         lines += ["", "  Warnings", ""]
         for warning, count in report["warnings"].items():

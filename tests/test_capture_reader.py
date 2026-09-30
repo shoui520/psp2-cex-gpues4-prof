@@ -82,8 +82,12 @@ class CaptureReaderTests(unittest.TestCase):
             self.events,base['draws'],base['scenes'],samples,0)
         timing = base['sampled_fragment_timing']
         timing['passes'] = [dict(name='Small', estimated_ms=1),
-                            dict(name='Large', estimated_ms=1234.5),
-                            dict(name='unsafe\x1b[31m', estimated_ms=0)]
+                            dict(name='Large', estimated_ms=1234.5)]
+        for draw, name, cost in zip(base['draws'], ['Small', 'Large'], [1, 1234.5]):
+            draw.update({'pass': name, 'sampled_fragment_ms': cost,
+                         'name': 'unsafe\x1b[31m'})
+        import copy
+        original = copy.deepcopy(base)
         text = reader.format_report(base)
         self.assertLess(text.index('Large'),text.index('Small'))
         self.assertIn('1,234.500 ms',text)
@@ -92,6 +96,30 @@ class CaptureReaderTests(unittest.TestCase):
         self.assertIn('Draws without timing',text)
         self.assertNotIn('\x1b',text)
         self.assertLess(text.index('Large'),text.index('Recorded events'))
+        self.assertIn('Most expensive draw groups', text)
+        self.assertIn('Fragment shaders', text)
+        self.assertIn('Timed draws', text)
+        self.assertIn('Sample gap · max', text)
+        self.assertIn('unsafe\\x1b[31m', text)
+        self.assertEqual(base, original)
+
+    def test_text_report_limits_and_unknown_cost(self):
+        import copy
+        base, samples = self.timing_fixture()
+        base['sampled_fragment_timing'] = reader.sampled_timing(
+            self.events, base['draws'], base['scenes'], samples, 0)
+        template = base['draws'][0]
+        for i in range(10):
+            draw = copy.deepcopy(template)
+            draw.update(name=f'Untimed {i}', sampled_fragment_ms=None)
+            draw['fragment_shader'].update(handle=300+i, name=f'Shader {i}')
+            base['draws'].append(draw)
+        text = reader.format_report(base)
+        self.assertIn('… 3 more in --json', text)
+        row = next(line for line in text.splitlines() if ' / Shader 0' in line)
+        self.assertIn('—', row)
+        self.assertIn('0/1', row)
+        self.assertNotIn('0.000 ms', row)
 
     def test_text_report_without_timing(self):
         result = reader.summarize([])
@@ -99,6 +127,115 @@ class CaptureReaderTests(unittest.TestCase):
         self.assertIn('Fragment timing unavailable',text)
         self.assertIn('missing explicit GXM identity seed',text)
         self.assertNotIn('█',text)
+
+    def pipeline_fixture(self, group=71):
+        base, samples = self.timing_fixture()
+        for sample in samples:
+            sample.update(group=group, tag_group=70, abi=1)
+            for core in sample['cores']:
+                core.update(tag_before=core['pds_before'], tag_after=core['pds_after'],
+                            flags=1, value=0)
+        base['diagnostics'] = samples
+        base['sampled_fragment_timing'] = reader.sampled_timing(
+            self.events, base['draws'], base['scenes'], samples, 0)
+        return base
+
+    def metric(self, analysis, name):
+        return next(m for m in analysis['pipeline_activity']['metrics'] if m['id'] == name)
+
+    def test_pipeline_rates_units_and_missing_metrics(self):
+        base = self.pipeline_fixture()
+        base['diagnostics'][0]['cores'][0]['value'] = (1 << 3) | 1
+        result = reader.agent_report(base)
+        metric = self.metric(result, 'usse_running')
+        self.assertEqual(metric['asserted'], 1)
+        self.assertEqual(metric['observed'], 8)
+        self.assertEqual(metric['sample_hit_pct'], 12.5)
+        self.assertEqual(metric['covered_units'], 4)
+        self.assertEqual(metric['expected_units'], 16)
+        self.assertEqual(sum(u['observed'] for u in metric['units']), 8)
+        self.assertIsNone(self.metric(result, 'texture_l1_l2_stall')['sample_hit_pct'])
+        self.assertEqual(self.metric(result, 'usse_stalled')['sample_hit_pct'], 0)
+        self.assertFalse(result['pipeline_activity']['exclusive_draw_ownership'])
+        text = reader.format_report(base)
+        self.assertIn('12.5%', text)
+        self.assertIn('No matched samples: Shader waits, Texture / data cache', text)
+
+    def test_pipeline_correlations_keep_per_pass_denominators(self):
+        base = self.pipeline_fixture()
+        base['draws'][0]['pass'] = 'First'
+        base['draws'][1]['pass'] = 'Second'
+        for core in base['diagnostics'][0]['cores']:
+            core['value'] = 1 << 3
+        activity = reader.agent_report(base)['pipeline_activity']
+        passes = {p['name']: p for p in activity['by_pass']}
+        def running(p):
+            return next(m for m in p['metrics'] if m['id'] == 'usse_running')
+        self.assertEqual(running(passes['First'])['sample_hit_pct'], 100)
+        self.assertEqual(running(passes['Second'])['sample_hit_pct'], 0)
+        self.assertEqual(running(passes['First'])['observed'], 4)
+        self.assertEqual(running(activity['by_fragment_shader'][0])['observed'], 8)
+
+    def test_pipeline_keeps_stage_disagreement_without_exclusive_attribution(self):
+        base = self.pipeline_fixture()
+        for sample in base['diagnostics']:
+            for core in sample['cores']:
+                core.update(tag_before=0x20090000, tag_after=0x20090000, flags=33)
+        activity = reader.agent_report(base)['pipeline_activity']
+        self.assertEqual(activity['accepted_core_observations'], 8)
+        self.assertEqual(activity['association_hazards']['PDS/TAG stage disagreement'], 8)
+
+    def test_pipeline_rejects_inconsistent_flags_unknown_driver_and_abi(self):
+        base = self.pipeline_fixture()
+        base['diagnostics'][0]['cores'][0]['flags'] = 33
+        activity = reader.agent_report(base)['pipeline_activity']
+        self.assertEqual(activity['accepted_core_observations'], 7)
+        self.assertEqual(activity['rejected_core_observations']['inconsistent diagnostic flags'], 1)
+        base['diagnostics'][0]['abi'] = 2
+        base['diagnostics'][1]['driver_fingerprint'] = 0
+        activity = reader.agent_report(base)['pipeline_activity']
+        self.assertFalse(activity['available'])
+        self.assertEqual(activity['rejected_core_observations']['unsupported ABI/driver'], 8)
+
+    def test_pipeline_does_not_count_failed_or_unmatched_samples_as_idle(self):
+        base = self.pipeline_fixture()
+        base['diagnostics'][0].update(result=-1, cores=[])
+        base['sampled_fragment_timing']['signal_windows'] = []
+        activity = reader.agent_report(base)['pipeline_activity']
+        self.assertFalse(activity['available'])
+        self.assertIsNone(activity['metrics'][0]['sample_hit_pct'])
+        self.assertEqual(activity['rejected_core_observations']['outside matched PDS draw windows'], 4)
+
+    def test_pipeline_foreign_process_excluded_by_matcher(self):
+        base = self.pipeline_fixture()
+        for sample in base['diagnostics']:
+            sample['process_id'] = 99
+        base['sampled_fragment_timing'] = reader.sampled_timing(
+            self.events, base['draws'], base['scenes'], base['diagnostics'], 0)
+        self.assertFalse(reader.agent_report(base)['pipeline_activity']['available'])
+
+    def test_pipeline_unknown_group_not_decoded(self):
+        base = self.pipeline_fixture(group=999)
+        activity = reader.agent_report(base)['pipeline_activity']
+        self.assertFalse(activity['available'])
+        self.assertEqual(activity['rejected_core_observations']['unsupported signal group'], 8)
+
+    def test_pipeline_zero_and_tiny_nonzero_are_distinct(self):
+        from unittest.mock import patch
+        base = self.pipeline_fixture()
+        result = reader.agent_report(base)
+        m = self.metric(result, 'usse_running')
+        m.update(sample_hit_pct=.04, asserted=1, observed=2500)
+        with patch.object(reader, 'agent_report', return_value=result):
+            text = reader.format_report(base)
+        self.assertIn('<0.1%', text)
+        self.assertIn('1/2,500', text)
+        self.assertIn('▏', text)
+
+    def test_capture_span_excludes_untimestamped_seed(self):
+        self.event(kind=24, before_us=0, after_us=0, args=(365,7,0,0))
+        self.event(kind=17, call=9, before_us=1000000, after_us=1000100)
+        self.assertEqual(reader.summarize(self.events)['capture_span_us'],100)
 
     def test_agent_report_rankings_and_coverage(self):
         import json
